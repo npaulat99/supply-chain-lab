@@ -36,6 +36,14 @@ Learn the concepts and standards behind modern supply chain security before impl
 
 ---
 
+# Supply Chain Threats Overview
+
+![Supply Chain Threats](supply-chain-threats.svg)
+
+*Source: [SLSA Threats Overview](https://slsa.dev/spec/v1.2-rc2/threats-overview)*
+
+---
+
 ## Lab Overview
 
 **Three Practical Phases**:
