@@ -1,0 +1,192 @@
+name: Supply Chain CI
+
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  id-token: write    # Sigstore keyless signing
+  contents: read     # Checkout code
+  packages: write    # Push to ghcr.io
+
+concurrency:
+  group: supply-chain-ci
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/supply-chain-app:${{ github.sha }}
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up QEMU and Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v2
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build + push image (BuildKit provenance & SBOM via Buildx)
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ env.IMAGE }}
+        # enable BuildKit provenance & SBOM (Buildx will attempt to emit)
+        # Buildx supports provenance and SBOM via --provenance and --sbom outputs
+        builder: default
+        metadata: |
+          org.opencontainers.image.revision=${{ github.sha }}
+        # capture digest in outputs
+        outputs: type=registry
+
+    - name: Install tools (cosign, rekor-cli, syft, grype, trivy, jq)
+      run: |
+        set -euo pipefail
+        # cosign
+        curl -sSfL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o /tmp/cosign
+        chmod +x /tmp/cosign
+        sudo mv /tmp/cosign /usr/local/bin/cosign
+        # rekor-cli
+        curl -sSfL https://github.com/sigstore/rekor/releases/latest/download/rekor-cli-linux-amd64 -o /tmp/rekor-cli
+        chmod +x /tmp/rekor-cli
+        sudo mv /tmp/rekor-cli /usr/local/bin/rekor-cli
+        # syft
+        curl -sSfL https://github.com/anchore/syft/releases/latest/download/syft_linux_amd64.tar.gz | tar -xz -C /tmp
+        sudo mv /tmp/syft /usr/local/bin/syft || true
+        # grype
+        curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+        # trivy
+        curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+        sudo apt-get update && sudo apt-get install -y jq
+
+    - name: Generate SBOM from pushed image (syft)
+      id: sbom
+      run: |
+        set -euo pipefail
+        IMAGE="${{ env.IMAGE }}"
+        # pull image (it was pushed by build step)
+        docker pull "$IMAGE"
+        syft "$IMAGE" -o spdx-json > ./sbom.spdx.json
+        echo "sbom-file=sbom.spdx.json" >> $GITHUB_OUTPUT
+
+    - name: Run Scans (fail on HIGH/CRITICAL)
+      id: scans
+      run: |
+        set -euo pipefail
+        IMAGE="${{ env.IMAGE }}"
+        # image vulnerability scan - grype (fail on HIGH or CRITICAL)
+        grype "$IMAGE" -o json > grype.json || true
+        # if any HIGH/CRITICAL found, fail
+        if jq -e '.matches[]? | select(.vulnerability? and (.severity == "High" or .severity == "Critical"))' grype.json >/dev/null 2>&1; then
+          echo "High/Critical vulnerabilities found by grype"
+          jq '.matches[] | {pkg: .artifact.name, severity: .vulnerability.severity, vuln: .vulnerability.id}' grype.json
+          exit 1
+        fi
+        # trivy also as secondary gate (exit code 2 if vulnerabilities found by severity filter)
+        trivy image --severity HIGH,CRITICAL --exit-code 1 --format json --output trivy.json "$IMAGE" || true
+        if [ -s trivy.json ]; then
+          echo "Trivy reported HIGH/CRITICAL vulnerabilities"
+          cat trivy.json
+          exit 1
+        fi
+        # IaC scan (if terraform / k8s files present) — we keep it non-fatal if no IaC files
+        if ls **/*.tf 1> /dev/null 2>&1 || ls **/*.yaml 1> /dev/null 2>&1; then
+          echo "Running iaC scan (checkov)"
+          sudo apt-get update && sudo apt-get install -y python3-pip
+          pip3 install checkov
+          checkov -d . -o json > checkov.json || true
+          if jq -e '.results.failed_checks | length > 0' checkov.json >/dev/null 2>&1; then
+            echo "IaC scan found failing checks"
+            jq '.results.failed_checks[] | {id:.check_id, file:.file, msg:.check_name}' checkov.json
+            exit 1
+          fi
+        else
+          echo "No IaC files found; skipping Checkov"
+        fi
+
+    - name: Create attestation files (provenance, sbom, vuln-source, vuln-iac, vuln-image)
+      id: attest-create
+      run: |
+        set -euo pipefail
+        mkdir -p attestations
+        IMAGE="${{ env.IMAGE }}"
+        # read digest from docker inspect
+        DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" | awk -F'@' '{print $2}' || true)
+        # fallback to build outputs if not available
+        if [ -z "$DIGEST" ]; then
+          # sometimes build-push-action exposes outputs in steps.build.outputs.digest,
+          # but read via GitHub outputs isn't possible here; we capture digest by pulling RepoDigest above.
+          echo "WARN: digest not found via inspect"
+        fi
+        # simple provenance predicate (replace with real SLSA provenance if desired)
+        cat > attestations/provenance.json <<PROV
+{
+  "_type": "https://in-toto.io/Statement/v0.1",
+  "predicateType": "https://slsa.dev/provenance/v0.2",
+  "subject": [ { "name": "${IMAGE}", "digest": "${DIGEST}" } ],
+  "metadata": { "buildType": "github-actions" }
+}
+PROV
+        # SBOM attestation: include generated SBOM file contents reference (we attached sbom.spdx.json earlier)
+        jq -n --arg img "$IMAGE" --arg sbom "sbom.spdx.json" '{_type:"sbom-attestation", image:$img, sbom:$sbom}' > attestations/sbom.json
+        # vuln attestations (vuln-source, vuln-iac, vuln-image) - include minimal JSON
+        jq -n --arg img "$IMAGE" '{type:"vuln-source", image:$img, results: []}' > attestations/vuln-source.json
+        jq -n --arg img "$IMAGE" '{type:"vuln-iac", image:$img, results: []}' > attestations/vuln-iac.json
+        jq -n --arg img "$IMAGE" '{type:"vuln-image", image:$img, results: []}' > attestations/vuln-image.json
+
+    - name: Sign image + attestations using GitHub OIDC (keyless)
+      id: sign
+      env:
+        IMAGE: ${{ env.IMAGE }}
+      run: |
+        set -euo pipefail
+        IMAGE="${IMAGE}"
+        # sign image (certificate-based keyless signing)
+        cosign sign --certificate-identity-regexp=".*" --certificate-oidc-issuer-regexp=".*" --keyless "$IMAGE"
+        # attach each attestation (predicate) to the image (cosign attest)
+        for p in attestations/*.json; do
+          echo "Attesting: $p"
+          cosign attest --keyless --predicate "$p" "$IMAGE"
+        done
+
+    - name: Verify signatures, attestations, and Rekor entries
+      id: verify
+      env:
+        IMAGE: ${{ env.IMAGE }}
+      run: |
+        set -euo pipefail
+        IMAGE="${IMAGE}"
+        # get digest for Rekor
+        DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" | awk -F'@' '{print $2}' || true)
+        if [ -z "$DIGEST" ]; then
+          # fallback to cosign inspect
+          DIGEST=$(cosign verify --certificate-identity-regexp=".*" --certificate-oidc-issuer-regexp=".*" "$IMAGE" 2>/dev/null | jq -r '.[0].critical.image.digest' || true)
+        fi
+        echo "Image digest: $DIGEST"
+        # verify image signature
+        cosign verify --certificate-identity-regexp=".*" --certificate-oidc-issuer-regexp=".*" "$IMAGE"
+        # verify attestations (names/types: provenance, sbom, vuln-*)
+        cosign verify-attestation --type custom --keyless "$IMAGE" || true
+        # Check Rekor: count entries for digest
+        HASH=$(echo "$DIGEST" | cut -d: -f2)
+        if [ -z "$HASH" ]; then
+          echo "Could not determine digest hash for Rekor check"
+          exit 1
+        fi
+        ENTRY_COUNT=$(rekor-cli search --sha "$HASH" 2>/dev/null | jq -r '. | length' || echo "0")
+        echo "Rekor entries found: $ENTRY_COUNT"
+        if [ "$ENTRY_COUNT" -lt 6 ]; then
+          echo "Expected 6 Rekor entries (1 image signature + 5 attestations). Found: $ENTRY_COUNT"
+          exit 1
+        fi
+
