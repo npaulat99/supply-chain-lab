@@ -24,8 +24,9 @@ jobs:
         uses: docker/setup-buildx-action@v2
 
       - name: Install Trivy
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+        uses: aquasecurity/trivy-action@v1
+        with:
+          version: '0.41.2'
 
       - name: Run Security Scans
         run: |
