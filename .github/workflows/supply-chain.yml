@@ -27,30 +27,46 @@ jobs:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Install Trivy
-        uses: aquasecurity/trivy-action@v0.2.5
-
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
 
       # ------------------------------
-      # Run security scans
+      # Security scans (Trivy)
       # ------------------------------
-      - name: Security Scans
-        run: |
-          echo "Scanning source code..."
-          trivy fs --severity HIGH,CRITICAL --exit-code 1 src/
-          echo "Scanning dependencies..."
-          trivy fs --severity HIGH,CRITICAL --exit-code 1 src/ --scan-all
-          echo "Scanning Dockerfile..."
-          trivy dockerfile --severity HIGH,CRITICAL --exit-code 1 src/docker/Dockerfile
-          echo "Scanning IaC..."
-          trivy config --severity HIGH,CRITICAL --exit-code 1 src/iac/
-          echo "Scanning K8s manifests..."
-          trivy config --severity HIGH,CRITICAL --exit-code 1 src/k8s/
+      - name: Scan source code
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: src/
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Scan Dockerfile
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: dockerfile
+          scan-ref: src/docker/Dockerfile
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Scan IaC
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: config
+          scan-ref: src/iac/
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Scan Kubernetes manifests
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: config
+          scan-ref: src/k8s/
+          severity: HIGH,CRITICAL
+          exit-code: 1
 
       # ------------------------------
-      # Build image and generate attestations
+      # Build container + attestations
       # ------------------------------
       - name: Build container with BuildKit + SBOM/Provenance
         uses: docker/build-push-action@v5
@@ -59,9 +75,6 @@ jobs:
           push: false
           load: true
           tags: ${{ env.IMAGE }}
-          build-args: |
-            BUILD_ENV=ci
-          outputs: type=local,dest=out
           provenance: true
           sbom: true
 
@@ -74,7 +87,7 @@ jobs:
           jq '.predicate' out/provenance.json > attestations/provenance.json
 
       # ------------------------------
-      # Generate vulnerability attestations
+      # Vulnerability attestations
       # ------------------------------
       - name: Generate Vulnerability Attestations
         run: |
@@ -83,7 +96,7 @@ jobs:
           trivy image --format cosign-vuln --output attestations/vuln-image.json ${{ env.IMAGE }}
 
       # ------------------------------
-      # Keyless Signing (image + attestations)
+      # Keyless Signing via Cosign
       # ------------------------------
       - name: Sign Container Image
         run: |
