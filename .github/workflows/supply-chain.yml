@@ -1,92 +1,170 @@
-name: Supply Chain CI/CD
+name: Supply Chain CI
 
 on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
 
 permissions:
-  id-token: write        # Sigstore keyless signing
-  contents: read         # Checkout code
-  packages: write        # Push to GHCR
+  id-token: write       # Required for keyless signing (Cosign)
+  contents: read        # Required to checkout code
+  packages: write       # Push images to GitHub Container Registry
 
 jobs:
   supply-chain:
+    name: Supply Chain Pipeline
     runs-on: ubuntu-latest
+
     env:
-      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/supply-chain-app:${{ github.sha }}
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/supply-chain-app
+      IMAGE_TAG: ${{ github.sha }}
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v3
 
+      # -----------------------------
+      # Security Scans
+      # -----------------------------
+      - name: Scan source code
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: src/
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Scan dependencies
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: src/
+          scan-all: true
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Scan Dockerfile
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: dockerfile
+          scan-ref: src/docker/Dockerfile
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Scan IaC
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: config
+          scan-ref: src/iac/
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Scan Kubernetes Manifests
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: config
+          scan-ref: src/k8s/
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      # -----------------------------
+      # Build container + attestation
+      # -----------------------------
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
-      - name: Install Trivy
-        uses: aquasecurity/trivy-action@v0.2.4
-
-      - name: Run Security Scans
-        run: |
-          echo "Scanning source code..."
-          trivy fs src/ --severity HIGH,CRITICAL --exit-code 1
-
-          echo "Scanning Dockerfile..."
-          trivy dockerfile src/docker/Dockerfile --severity HIGH,CRITICAL --exit-code 1
-
-          echo "Scanning IaC..."
-          trivy config src/iac/ --severity HIGH,CRITICAL --exit-code 1
-
-          echo "Scanning K8s manifests..."
-          trivy config src/k8s/ --severity HIGH,CRITICAL --exit-code 1
-
-      - name: Build Docker Image with Attestations
+      - name: Build and generate attestations
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: src/docker/Dockerfile
-          push: true
-          tags: ${{ env.IMAGE_NAME }}
+          push: false
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+          outputs: type=image,name=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
           provenance: true
           sbom: true
 
-      - name: Capture Image Digest
+      - name: Capture image digest
         id: digest
         run: |
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.IMAGE_NAME }})
-          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }})
+          echo "DIGEST=$DIGEST" >> $GITHUB_ENV
+          echo "IMAGE=$DIGEST" >> $GITHUB_ENV
+          echo "Image: $DIGEST"
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v2
+      # -----------------------------
+      # Sign image & attestations
+      # -----------------------------
+      - name: Keyless sign container image
+        uses: sigstore/cosign-action@v2
         with:
-          version: v3.11.1
+          image: ${{ env.IMAGE }}
+          annotations: |
+            org.opencontainers.image.source=${{ github.repository }}
+          upload: true
 
-      - name: Sign Docker Image
-        run: |
-          cosign sign --oidc-token ${{ github.token }} ${{ steps.digest.outputs.digest }}
+      - name: Sign provenance attestation
+        uses: sigstore/cosign-action@v2
+        with:
+          image: ${{ env.IMAGE }}
+          predicate-path: attestations/provenance.json
+          type: slsaprovenance
+          upload: true
 
-      - name: Sign SLSA Provenance
-        run: |
-          cosign attest --type slsaprovenance --predicate attestations/provenance.json ${{ steps.digest.outputs.digest }}
+      - name: Sign SBOM attestation
+        uses: sigstore/cosign-action@v2
+        with:
+          image: ${{ env.IMAGE }}
+          predicate-path: attestations/sbom.json
+          type: spdxjson
+          upload: true
 
-      - name: Sign SBOM Attestation
-        run: |
-          cosign attest --type spdxjson --predicate attestations/sbom.json ${{ steps.digest.outputs.digest }}
+      - name: Sign vulnerability attestations (source, IaC, image)
+        uses: sigstore/cosign-action@v2
+        with:
+          image: ${{ env.IMAGE }}
+          predicate-path: |
+            attestations/vuln-source.json
+            attestations/vuln-iac.json
+            attestations/vuln-image.json
+          type: vuln
+          upload: true
 
-      - name: Sign Vulnerability Attestations
-        run: |
-          cosign attest --type vuln --predicate attestations/vuln-source.json ${{ steps.digest.outputs.digest }}
-          cosign attest --type vuln --predicate attestations/vuln-iac.json ${{ steps.digest.outputs.digest }}
-          cosign attest --type vuln --predicate attestations/vuln-image.json ${{ steps.digest.outputs.digest }}
+      # -----------------------------
+      # Push image to GitHub Container Registry
+      # -----------------------------
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify Signatures & Attestations
+      - name: Push image with digest
         run: |
-          cosign verify --certificate-identity-regexp=".*" --certificate-oidc-issuer-regexp=".*" ${{ steps.digest.outputs.digest }}
-          cosign verify-attestation --type slsaprovenance --certificate-identity-regexp=".*" --certificate-oidc-issuer-regexp=".*" ${{ steps.digest.outputs.digest }}
-          cosign verify-attestation --type spdxjson --certificate-identity-regexp=".*" --certificate-oidc-issuer-regexp=".*" ${{ steps.digest.outputs.digest }}
-          cosign verify-attestation --type vuln --certificate-identity-regexp=".*" --certificate-oidc-issuer-regexp=".*" ${{ steps.digest.outputs.digest }}
+          docker push ${{ env.IMAGE }}
 
-      - name: Check Rekor Transparency Log
+      # -----------------------------
+      # Verify signatures & attestations
+      # -----------------------------
+      - name: Verify image signature
+        uses: sigstore/cosign-action@v2
+        with:
+          image: ${{ env.IMAGE }}
+          verify: true
+
+      - name: Verify attestations
         run: |
-          HASH=$(echo ${{ steps.digest.outputs.digest }} | cut -d@ -f2 | cut -d: -f2)
+          cosign verify-attestation --type slsaprovenance ${{ env.IMAGE }}
+          cosign verify-attestation --type spdxjson ${{ env.IMAGE }}
+          cosign verify-attestation --type vuln ${{ env.IMAGE }}
+
+      - name: Verify Rekor transparency log
+        run: |
+          HASH=$(echo ${{ env.DIGEST }} | cut -d@ -f2 | cut -d: -f2)
           rekor-cli search --sha $HASH
